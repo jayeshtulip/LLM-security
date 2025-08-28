@@ -1,0 +1,137 @@
+﻿apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-llm-server
+  namespace: loan-default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cpu-llm-server
+  template:
+    metadata:
+      labels:
+        app: cpu-llm-server
+    spec:
+      containers:
+      - name: llm-server
+        image: python:3.9-slim
+        command: ["/bin/bash"]
+        args: ["-c", "pip install transformers torch flask accelerate && python /app/llm_server.py"]
+        ports:
+        - containerPort: 8081
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        volumeMounts:
+        - name: llm-code
+          mountPath: /app
+      volumes:
+      - name: llm-code
+        configMap:
+          name: cpu-llm-code
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cpu-llm-code
+  namespace: loan-default
+data:
+  llm_server.py: |
+    from flask import Flask, request, jsonify
+    from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+    import torch
+    import logging
+
+    app = Flask(__name__)
+    logging.basicConfig(level=logging.INFO)
+
+    # Global LLM pipeline
+    llm_pipeline = None
+
+    def load_llm():
+        global llm_pipeline
+        try:
+            # Use smaller CPU-optimized model
+            model_name = "microsoft/DialoGPT-medium"
+            
+            app.logger.info(f"Loading {model_name} for CPU inference...")
+            
+            llm_pipeline = pipeline(
+                "text-generation",
+                model=model_name,
+                tokenizer=model_name,
+                device=-1,  # CPU only
+                max_length=512,
+                do_sample=True,
+                temperature=0.7
+            )
+            
+            app.logger.info("LLM loaded successfully")
+            return True
+            
+        except Exception as e:
+            app.logger.error(f"Failed to load LLM: {e}")
+            return False
+
+    @app.route('/health', methods=['GET'])
+    def health():
+        if llm_pipeline is None:
+            return jsonify({'status': 'unhealthy', 'message': 'LLM not loaded'}), 503
+        return jsonify({'status': 'healthy', 'model': 'DialoGPT-medium'})
+
+    @app.route('/analyze_loan', methods=['POST'])
+    def analyze_loan():
+        if llm_pipeline is None:
+            return jsonify({'error': 'LLM not loaded'}), 503
+        
+        try:
+            data = request.get_json()
+            
+            # Create prompt for loan analysis
+            prompt = f"""
+            Loan Application Analysis:
+            Credit Score: {data.get('credit_score', 'N/A')}
+            Annual Income: 
+            Loan Amount: 
+            Employment Years: {data.get('employment_years', 'N/A')}
+            ML Prediction: {data.get('ml_prediction', 'N/A')}
+            
+            Provide a brief risk assessment:
+            """
+            
+            # Generate response
+            response = llm_pipeline(prompt, max_length=200, num_return_sequences=1)
+            analysis = response[0]['generated_text'][len(prompt):]
+            
+            return jsonify({
+                'llm_analysis': analysis.strip(),
+                'model_used': 'DialoGPT-medium',
+                'input_data': data
+            })
+            
+        except Exception as e:
+            return jsonify({'error': str(e)}), 400
+
+    if __name__ == '__main__':
+        if load_llm():
+            app.run(host='0.0.0.0', port=8081, debug=False)
+        else:
+            exit(1)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cpu-llm-service
+  namespace: loan-default
+spec:
+  selector:
+    app: cpu-llm-server
+  ports:
+  - port: 8081
+    targetPort: 8081
+  type: LoadBalancer

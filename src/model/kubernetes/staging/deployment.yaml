@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-model-secure
+  namespace: staging
+  labels:
+    app: ml-model
+    environment: staging
+spec:
+  replicas: 1  # Lower resources for staging
+  selector:
+    matchLabels:
+      app: ml-model
+      environment: staging
+  template:
+    metadata:
+      labels:
+        app: ml-model
+        environment: staging
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: ml-model-sa-staging
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+      containers:
+      - name: ml-model
+        image: ghcr.io/your-org/ml-model:latest
+        imagePullPolicy: Always
+        
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        
+        ports:
+        - containerPort: 8000
+          name: http
+        
+        env:
+        - name: ENVIRONMENT
+          value: "staging"
+        - name: LOG_LEVEL
+          value: "DEBUG"
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ml-model-secrets-staging
+              key: api-key
+        
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        
+        volumeMounts:
+        - name: tmp-volume
+          mountPath: /tmp
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      
+      volumes:
+      - name: tmp-volume
+        emptyDir: {}

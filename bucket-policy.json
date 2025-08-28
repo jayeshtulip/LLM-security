@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::365021531163:role/eksctl-loan-eks-simple-nodegroup-n-NodeInstanceRole-3aNKPzEv17VS"
+      },
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::loan-mlops-mlflow-bucket",
+        "arn:aws:s3:::loan-mlops-mlflow-bucket/*"
+      ]
+    }
+  ]
+}

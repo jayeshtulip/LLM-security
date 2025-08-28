@@ -1,0 +1,365 @@
+# .github/workflows/secure-ml-pipeline.yml - Production-ready CI/CD pipeline
+name: Secure ML Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/ml-model
+
+jobs:
+  # Security Gates - Run First
+  security-scan:
+    runs-on: ubuntu-latest
+    name: Security Scan
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pip-audit bandit safety
+
+    - name: Run Bandit security scan
+      run: |
+        bandit -r src/ -f json -o bandit-report.json
+        bandit -r src/ --severity-level medium
+
+    - name: Run pip-audit vulnerability scan
+      run: |
+        pip-audit --format=json --output=pip-audit-report.json
+        pip-audit --desc
+
+    - name: Run Safety scan
+      run: |
+        safety scan --json > safety-report.json || true
+        safety scan
+
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          pip-audit-report.json
+          safety-report.json
+
+    - name: Security gate check
+      run: |
+        echo "Checking security scan results..."
+        # Fail if pip-audit found vulnerabilities
+        if pip-audit --format=json | jq -e '.vulnerabilities | length > 0' >/dev/null 2>&1; then
+          echo "❌ SECURITY GATE FAILED: Vulnerabilities found!"
+          exit 1
+        fi
+        echo "✅ Security gate passed"
+
+  # Code Quality Checks
+  quality-check:
+    runs-on: ubuntu-latest
+    name: Code Quality
+    needs: security-scan
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install black isort flake8 mypy
+
+    - name: Format check with Black
+      run: black --check src/ tests/
+
+    - name: Import sorting check
+      run: isort --check-only src/ tests/
+
+    - name: Lint with flake8
+      run: flake8 src/ tests/ --max-line-length=88 --extend-ignore=E203,W503
+
+    - name: Type check with mypy
+      run: mypy src/ --ignore-missing-imports
+
+  # Test Suite with Model Validation
+  test-and-validate:
+    runs-on: ubuntu-latest
+    name: Test & Model Validation
+    needs: [security-scan, quality-check]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run unit tests
+      run: |
+        python -m pytest tests/unit/ -v --cov=src --cov-report=xml --cov-report=term
+
+    - name: Run integration tests
+      run: |
+        python -m pytest tests/integration/ -v
+
+    - name: Model Performance Gate (F1 > 0.3)
+      run: |
+        echo "🧪 Testing model performance..."
+        python -c "
+        import sys
+        sys.path.append('src')
+        from model.predictor import LoanPredictor
+        from model.model_validator import validate_model_performance
+        
+        predictor = LoanPredictor()
+        metrics = validate_model_performance(predictor.model, predictor.preprocessor)
+        
+        print(f'Model F1 Score: {metrics[\"f1_score\"]:.4f}')
+        print(f'Model Accuracy: {metrics[\"accuracy\"]:.4f}')
+        
+        # F1 Score gate
+        if metrics['f1_score'] < 0.3:
+            print('❌ MODEL GATE FAILED: F1 score < 0.3')
+            sys.exit(1)
+        
+        print('✅ Model performance gate passed')
+        "
+
+    - name: Generate test report
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-results
+        path: |
+          coverage.xml
+          pytest-report.xml
+
+  # Build and Push Container
+  build-and-push:
+    runs-on: ubuntu-latest
+    name: Build & Push Image
+    needs: [security-scan, quality-check, test-and-validate]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.secure
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        platforms: linux/amd64
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        format: spdx-json
+        output-file: sbom.spdx.json
+
+    - name: Upload SBOM
+      uses: actions/upload-artifact@v3
+      with:
+        name: sbom
+        path: sbom.spdx.json
+
+  # Deploy to Staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    name: Deploy to Staging
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment:
+      name: staging
+      url: https://staging-api.yourdomain.com
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.27.0'
+
+    - name: Set up Kubeconfig
+      run: |
+        echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+
+    - name: Deploy to staging
+      run: |
+        # Update image in deployment
+        kubectl set image deployment/ml-model-secure \
+          ml-model=${{ needs.build-and-push.outputs.image-tag }} \
+          --namespace=staging
+
+        # Wait for rollout
+        kubectl rollout status deployment/ml-model-secure --namespace=staging --timeout=300s
+
+    - name: Run smoke tests
+      run: |
+        # Wait for service to be ready
+        sleep 30
+        
+        # Test health endpoint
+        kubectl port-forward svc/ml-model-service 8080:8000 --namespace=staging &
+        sleep 5
+        
+        # Basic smoke test
+        curl -f http://localhost:8080/health || exit 1
+        echo "✅ Staging deployment successful"
+
+  # Deploy to Production (Manual Approval Required)
+  deploy-production:
+    runs-on: ubuntu-latest
+    name: Deploy to Production
+    needs: [build-and-push, deploy-staging]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://api.yourdomain.com
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Production deployment checklist
+      run: |
+        echo "🚀 PRODUCTION DEPLOYMENT CHECKLIST"
+        echo "=================================="
+        echo "✅ Security scans passed"
+        echo "✅ All tests passed"
+        echo "✅ Model performance gate (F1 > 0.3) passed"
+        echo "✅ Staging deployment successful"
+        echo "✅ Manual approval received"
+        echo ""
+        echo "Proceeding with production deployment..."
+
+    - name: Configure kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.27.0'
+
+    - name: Set up Kubeconfig
+      run: |
+        echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+
+    - name: Deploy to production
+      run: |
+        # Blue-green deployment strategy
+        kubectl apply -f kubernetes/production/ --namespace=production
+        
+        # Update image
+        kubectl set image deployment/ml-model-secure \
+          ml-model=${{ needs.build-and-push.outputs.image-tag }} \
+          --namespace=production
+
+        # Wait for rollout with longer timeout for production
+        kubectl rollout status deployment/ml-model-secure --namespace=production --timeout=600s
+
+    - name: Production health check
+      run: |
+        # Wait for service to be ready
+        sleep 60
+        
+        # External health check (replace with your actual production URL)
+        curl -f https://api.yourdomain.com/health || exit 1
+        
+        echo "✅ Production deployment successful!"
+
+    - name: Notify deployment success
+      if: success()
+      run: |
+        echo "🎉 PRODUCTION DEPLOYMENT SUCCESSFUL"
+        echo "Model version: ${{ github.sha }}"
+        echo "Deploy time: $(date)"
+        # Add Slack/Teams notification here if desired
+
+  # Security Monitoring Post-Deployment
+  post-deployment-security:
+    runs-on: ubuntu-latest
+    name: Post-Deployment Security Check
+    needs: [deploy-staging]
+    if: always() && needs.deploy-staging.result == 'success'
+    steps:
+    - name: Container security scan
+      run: |
+        # Scan the deployed container for runtime vulnerabilities
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          aquasec/trivy image ${{ needs.build-and-push.outputs.image-tag }}
+
+    - name: API security test
+      run: |
+        # Basic security tests against deployed API
+        echo "Running basic API security tests..."
+        
+        # Test without authentication (should fail)
+        if curl -s -o /dev/null -w "%{http_code}" https://staging-api.yourdomain.com/predict | grep -q "401\|403"; then
+          echo "✅ Authentication required - Good"
+        else
+          echo "❌ API allows unauthenticated access!"
+          exit 1
+        fi

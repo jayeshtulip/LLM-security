@@ -1,0 +1,218 @@
+﻿apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loan-model-server
+  namespace: loan-default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: loan-model-server
+  template:
+    metadata:
+      labels:
+        app: loan-model-server
+    spec:
+      containers:
+      - name: model-server
+        image: python:3.9-slim
+        command: ["/bin/bash"]
+        args: ["-c", "pip install flask scikit-learn pandas numpy mlflow boto3 && python /app/serve_model.py"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: MLFLOW_TRACKING_URI
+          value: "http://mlflow-service:5000"
+        - name: MODEL_NAME
+          value: "balanced_loan_model"
+        - name: AWS_DEFAULT_REGION
+          value: "ap-south-1"
+        volumeMounts:
+        - name: model-code
+          mountPath: /app
+      volumes:
+      - name: model-code
+        configMap:
+          name: model-server-code
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-server-code
+  namespace: loan-default
+data:
+  serve_model.py: |
+    from flask import Flask, request, jsonify
+    import mlflow
+    import mlflow.sklearn
+    import pandas as pd
+    import numpy as np
+    import os
+    import logging
+    from sklearn.preprocessing import StandardScaler
+    
+    app = Flask(__name__)
+    logging.basicConfig(level=logging.INFO)
+    
+    # Global variables for model and scaler
+    model = None
+    scaler = None
+    model_info = {}
+    
+    def load_model():
+        global model, scaler, model_info
+        try:
+            # Set MLflow tracking URI
+            mlflow_uri = os.getenv('MLFLOW_TRACKING_URI', 'http://mlflow-service:5000')
+            mlflow.set_tracking_uri(mlflow_uri)
+            
+            # Get latest model from experiment
+            client = mlflow.tracking.MlflowClient()
+            experiment = client.get_experiment_by_name("loan-default-balanced")
+            
+            if experiment:
+                runs = client.search_runs(
+                    experiment_ids=[experiment.experiment_id],
+                    filter_string="tags.validation = 'passed'",
+                    order_by=["start_time desc"],
+                    max_results=1
+                )
+                
+                if runs:
+                    run_id = runs[0].info.run_id
+                    model_uri = f"runs:/{run_id}/balanced_loan_model"
+                    model = mlflow.sklearn.load_model(model_uri)
+                    
+                    # Store model info
+                    model_info = {
+                        'run_id': run_id,
+                        'f1_score': runs[0].data.metrics.get('f1_score', 'unknown'),
+                        'optimal_threshold': runs[0].data.params.get('optimal_threshold', '0.3'),
+                        'loaded_at': pd.Timestamp.now().isoformat()
+                    }
+                    
+                    # Create a dummy scaler (in production, this would be loaded from MLflow)
+                    scaler = StandardScaler()
+                    # Fit with dummy data matching training features
+                    dummy_data = np.array([[680, 50000, 20000, 3, 0.4]])
+                    scaler.fit(dummy_data)
+                    
+                    app.logger.info(f"Model loaded successfully: {model_info}")
+                    return True
+            
+            app.logger.error("No validated model found")
+            return False
+            
+        except Exception as e:
+            app.logger.error(f"Failed to load model: {e}")
+            return False
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        if model is None:
+            return jsonify({'status': 'unhealthy', 'message': 'Model not loaded'}), 503
+        return jsonify({
+            'status': 'healthy',
+            'model_info': model_info,
+            'timestamp': pd.Timestamp.now().isoformat()
+        })
+    
+    @app.route('/predict', methods=['POST'])
+    def predict():
+        if model is None:
+            return jsonify({'error': 'Model not loaded'}), 503
+        
+        try:
+            # Parse input
+            data = request.get_json()
+            
+            # Expected features: credit_score, annual_income, loan_amount, employment_years, debt_to_income
+            features = np.array([[
+                data['credit_score'],
+                data['annual_income'], 
+                data['loan_amount'],
+                data['employment_years'],
+                data.get('debt_to_income', data['loan_amount'] * 12 / data['annual_income'])
+            ]])
+            
+            # Scale features
+            features_scaled = scaler.transform(features)
+            
+            # Get prediction probability
+            proba = model.predict_proba(features_scaled)[0, 1]
+            
+            # Use optimal threshold from training
+            threshold = float(model_info.get('optimal_threshold', 0.3))
+            prediction = 'default' if proba >= threshold else 'approve'
+            
+            # Risk score
+            risk_score = min(proba * 100, 100)
+            
+            return jsonify({
+                'prediction': prediction,
+                'probability': float(proba),
+                'risk_score': float(risk_score),
+                'threshold_used': threshold,
+                'model_info': {
+                    'run_id': model_info.get('run_id'),
+                    'f1_score': model_info.get('f1_score')
+                }
+            })
+            
+        except Exception as e:
+            return jsonify({'error': str(e)}), 400
+    
+    @app.route('/batch_predict', methods=['POST'])
+    def batch_predict():
+        if model is None:
+            return jsonify({'error': 'Model not loaded'}), 503
+        
+        try:
+            data = request.get_json()
+            loans = data['loans']
+            
+            results = []
+            for loan in loans:
+                features = np.array([[
+                    loan['credit_score'],
+                    loan['annual_income'],
+                    loan['loan_amount'], 
+                    loan['employment_years'],
+                    loan.get('debt_to_income', loan['loan_amount'] * 12 / loan['annual_income'])
+                ]])
+                
+                features_scaled = scaler.transform(features)
+                proba = model.predict_proba(features_scaled)[0, 1]
+                threshold = float(model_info.get('optimal_threshold', 0.3))
+                prediction = 'default' if proba >= threshold else 'approve'
+                
+                results.append({
+                    'loan_id': loan.get('loan_id', len(results)),
+                    'prediction': prediction,
+                    'probability': float(proba),
+                    'risk_score': float(min(proba * 100, 100))
+                })
+            
+            return jsonify({'predictions': results})
+            
+        except Exception as e:
+            return jsonify({'error': str(e)}), 400
+    
+    if __name__ == '__main__':
+        if load_model():
+            app.run(host='0.0.0.0', port=8080, debug=False)
+        else:
+            exit(1)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loan-model-service
+  namespace: loan-default
+spec:
+  selector:
+    app: loan-model-server
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: LoadBalancer

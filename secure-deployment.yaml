@@ -1,0 +1,150 @@
+﻿# Security hardening for model serving
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-loan-model-server
+  namespace: loan-default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: secure-loan-model-server
+  template:
+    metadata:
+      labels:
+        app: secure-loan-model-server
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: model-server
+        image: python:3.9-slim
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        ports:
+        - containerPort: 8080
+        env:
+        - name: MLFLOW_TRACKING_URI
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: tracking-uri
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: model-api-key
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: model-code
+          mountPath: /app
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: model-code
+        configMap:
+          name: secure-model-server-code
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mlflow-secrets
+  namespace: loan-default
+type: Opaque
+stringData:
+  tracking-uri: "http://mlflow-service:5000"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-secrets
+  namespace: loan-default
+type: Opaque
+stringData:
+  model-api-key: "your-secure-api-key-here"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: loan-model-network-policy
+  namespace: loan-default
+spec:
+  podSelector:
+    matchLabels:
+      app: secure-loan-model-server
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: loan-default
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: loan-default
+    ports:
+    - protocol: TCP
+      port: 5000  # MLflow
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-server-sa
+  namespace: loan-default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: model-server-role
+  namespace: loan-default
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: model-server-rolebinding
+  namespace: loan-default
+subjects:
+- kind: ServiceAccount
+  name: model-server-sa
+  namespace: loan-default
+roleRef:
+  kind: Role
+  name: model-server-role
+  apiGroup: rbac.authorization.k8s.io

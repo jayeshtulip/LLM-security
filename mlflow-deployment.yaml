@@ -1,0 +1,44 @@
+﻿apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow-server
+  namespace: loan-default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow-server
+  template:
+    metadata:
+      labels:
+        app: mlflow-server
+    spec:
+      containers:
+      - name: mlflow
+        image: python:3.9-slim
+        command: ["/bin/bash"]
+        args: ["-c", "pip install mlflow boto3 && mlflow server --backend-store-uri sqlite:///mlflow.db --default-artifact-root s3://loan-mlops-mlflow-bucket --host 0.0.0.0 --port 5000"]
+        ports:
+        - containerPort: 5000
+        env:
+        - name: AWS_DEFAULT_REGION
+          value: ap-south-1
+        volumeMounts:
+        - name: mlflow-storage
+          mountPath: /mlflow
+      volumes:
+      - name: mlflow-storage
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-service
+  namespace: loan-default
+spec:
+  selector:
+    app: mlflow-server
+  ports:
+  - port: 5000
+    targetPort: 5000
+  type: LoadBalancer

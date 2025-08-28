@@ -1,0 +1,275 @@
+# .github/environments/staging.yml - GitHub Environment Configuration
+# Note: These settings are configured in GitHub UI under Settings > Environments
+# Documentation for reference only
+
+environment:
+  name: staging
+  protection_rules:
+    - type: required_reviewers
+      required_reviewers: []  # No reviewers required for staging
+    - type: wait_timer
+      wait_timer: 0  # No wait time for staging
+  deployment_branch_policy:
+    protected_branches: false
+    custom_branch_policies: true
+    custom_branches: ["main", "develop"]
+
+---
+# .github/environments/production.yml - Production Environment with Approvals
+environment:
+  name: production
+  protection_rules:
+    - type: required_reviewers
+      required_reviewers: 
+        - "team-leads"  # GitHub team or individual users
+        - "platform-team"
+    - type: wait_timer
+      wait_timer: 5  # 5 minute wait time before deployment
+  deployment_branch_policy:
+    protected_branches: true  # Only deploy from protected branches
+    custom_branch_policies: false
+
+---
+# deployment-checklist.md - Pre-deployment checklist
+# ML Model Deployment Checklist
+
+## Pre-Deployment Validation ✅
+
+### Security Gates
+- [ ] No critical vulnerabilities in dependencies (pip-audit)
+- [ ] Code security scan passed (bandit)
+- [ ] Container security scan passed (trivy/clair)
+- [ ] Secrets properly configured and encrypted
+- [ ] RBAC policies applied
+- [ ] Network policies configured
+
+### Quality Gates  
+- [ ] All unit tests passed (coverage > 80%)
+- [ ] Integration tests passed
+- [ ] Code quality checks passed (black, flake8, mypy)
+- [ ] Model performance gate passed (F1 > 0.3)
+- [ ] Model validation on test data successful
+
+### Infrastructure Readiness
+- [ ] Kubernetes cluster healthy
+- [ ] Monitoring systems operational
+- [ ] Logging aggregation working
+- [ ] Backup systems configured
+- [ ] Resource quotas set appropriately
+
+### Staging Verification
+- [ ] Staging deployment successful
+- [ ] Health checks passing
+- [ ] API endpoints responding correctly
+- [ ] Authentication/authorization working
+- [ ] Rate limiting functional
+- [ ] Performance metrics within acceptable range
+
+### Production Readiness
+- [ ] Load balancer configured
+- [ ] SSL certificates valid
+- [ ] DNS records updated
+- [ ] Monitoring alerts configured
+- [ ] Runbook documentation updated
+- [ ] Rollback plan prepared
+
+## Deployment Approval Process
+
+### Staging Deployment (Automatic)
+- Triggered on: Push to `main` branch
+- Automatic deployment after all tests pass
+- No manual approval required
+
+### Production Deployment (Manual Approval Required)
+
+#### Approval Requirements
+1. **Technical Review** (Required)
+   - Platform/DevOps team approval
+   - Security team sign-off (for security-critical changes)
+   
+2. **Business Review** (For major releases)
+   - Product owner approval
+   - Business stakeholder sign-off
+
+#### Approval Process
+1. Developer triggers production deployment via GitHub Actions
+2. Deployment request sent to approvers
+3. Approvers review checklist and staging results
+4. Manual approval required from designated reviewers
+5. Optional 5-minute wait timer before deployment begins
+6. Deployment executes with monitoring
+
+#### Emergency Deployment Process
+- **Hotfix Exception**: Critical security fixes can bypass wait timer
+- **Emergency Contacts**: Platform team lead, Security team lead
+- **Post-deployment**: Immediate review and documentation required
+
+---
+# scripts/deployment-approval.sh - Deployment approval helper script
+#!/bin/bash
+
+# deployment-approval.sh - Helper script for deployment approvals
+set -e
+
+ENVIRONMENT=${1:-staging}
+BRANCH=$(git branch --show-current)
+COMMIT_SHA=$(git rev-parse HEAD)
+COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+
+echo "🚀 ML Model Deployment Approval Request"
+echo "======================================"
+echo "Environment: $ENVIRONMENT"
+echo "Branch: $BRANCH" 
+echo "Commit: $COMMIT_SHA"
+echo "Message: $COMMIT_MESSAGE"
+echo "Requestor: $(git config user.name) <$(git config user.email)>"
+echo "Timestamp: $(date)"
+echo ""
+
+# Check if all required checks have passed
+check_github_status() {
+    echo "📋 Checking GitHub status checks..."
+    
+    # Use GitHub CLI to check status
+    if command -v gh &> /dev/null; then
+        STATUS=$(gh api "repos/:owner/:repo/commits/$COMMIT_SHA/status" --jq '.state')
+        if [ "$STATUS" = "success" ]; then
+            echo "✅ All GitHub checks passed"
+        else
+            echo "❌ GitHub checks not all passing: $STATUS"
+            exit 1
+        fi
+    else
+        echo "⚠️  GitHub CLI not found, skipping automatic status check"
+    fi
+}
+
+# Generate deployment summary
+generate_deployment_summary() {
+    echo "📊 Deployment Summary"
+    echo "===================="
+    
+    # Model performance (if available)
+    if [ -f "model_metrics.json" ]; then
+        echo "Model Metrics:"
+        cat model_metrics.json | jq '.f1_score, .accuracy' || echo "Metrics file found but not parseable"
+    fi
+    
+    # Security scan results
+    if [ -f "security-summary.txt" ]; then
+        echo "Security Scan:"
+        cat security-summary.txt
+    fi
+    
+    # Test results
+    if [ -f "test-summary.txt" ]; then
+        echo "Test Results:"
+        cat test-summary.txt
+    fi
+}
+
+# Main approval flow
+case $ENVIRONMENT in
+    staging)
+        echo "🔄 Staging deployment - automatic approval"
+        check_github_status
+        echo "✅ Staging deployment approved automatically"
+        ;;
+    production)
+        echo "⏳ Production deployment - manual approval required"
+        check_github_status
+        generate_deployment_summary
+        echo ""
+        echo "📝 Approval Checklist:"
+        echo "□ Security scan passed"
+        echo "□ All tests passed"  
+        echo "□ Model performance gate passed (F1 > 0.3)"
+        echo "□ Staging deployment successful"
+        echo "□ Monitoring configured"
+        echo "□ Rollback plan ready"
+        echo ""
+        echo "🎯 Ready for manual approval in GitHub Actions"
+        echo "   Go to: https://github.com/your-org/your-repo/actions"
+        ;;
+    *)
+        echo "❌ Unknown environment: $ENVIRONMENT"
+        echo "Valid environments: staging, production"
+        exit 1
+        ;;
+esac
+
+---
+# .github/ISSUE_TEMPLATE/deployment-approval.md
+---
+name: Production Deployment Approval
+about: Request approval for production deployment
+title: 'Production Deployment: [Model Version] - [Date]'
+labels: deployment, production, approval-required
+assignees: platform-team
+
+---
+
+## Deployment Request 🚀
+
+**Model Version:** [e.g., v1.2.3]
+**Commit SHA:** [e.g., abc123def456]
+**Requested by:** @username
+**Target Date:** [YYYY-MM-DD]
+
+## Pre-Deployment Checklist ✅
+
+### Security & Compliance
+- [ ] Security scans passed (bandit, pip-audit, container scan)
+- [ ] No critical vulnerabilities
+- [ ] Secrets management verified
+- [ ] RBAC policies updated
+- [ ] Compliance requirements met
+
+### Quality Assurance
+- [ ] Unit tests passed (>80% coverage)
+- [ ] Integration tests passed
+- [ ] Model performance gate passed (F1 > 0.3)
+- [ ] Code review completed
+- [ ] Documentation updated
+
+### Infrastructure
+- [ ] Staging deployment successful
+- [ ] Load testing completed
+- [ ] Monitoring & alerting configured
+- [ ] Backup strategy verified
+- [ ] Rollback procedure tested
+
+### Business Approval
+- [ ] Product owner sign-off
+- [ ] Stakeholder notification sent
+- [ ] Change management ticket: [TICKET-ID]
+
+## Deployment Details
+
+**Changes in this release:**
+- [List major changes]
+- [Include any breaking changes]
+- [Note performance improvements]
+
+**Rollback Plan:**
+- [Describe rollback procedure]
+- [Estimated rollback time]
+- [Contact information for rollback]
+
+## Approval Sign-offs
+
+**Technical Approval:**
+- [ ] Platform Team Lead: @platform-lead
+- [ ] Security Team: @security-team
+
+**Business Approval:**
+- [ ] Product Owner: @product-owner
+- [ ] Business Stakeholder: @stakeholder
+
+## Post-Deployment
+
+- [ ] Health checks verified
+- [ ] Performance metrics normal
+- [ ] User acceptance testing completed
+- [ ] Documentation updated
+- [ ] Post-mortem scheduled (if needed)

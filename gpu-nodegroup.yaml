@@ -1,0 +1,19 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: loan-eks-simple
+  region: ap-south-1
+
+nodeGroups:
+  - name: ml-workers
+    instanceType: m5.large
+    desiredCapacity: 2
+    minSize: 1
+    maxSize: 3
+    labels:
+      workload: ml-inference
+    subnets:
+      - subnet-0c66df451bbe17c55
+      - subnet-00823415a1ff5d785
+      - subnet-0d90a0e84bb1aa792
