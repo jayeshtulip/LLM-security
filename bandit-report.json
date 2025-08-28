@@ -1,6 +1,6 @@
 {
   "errors": [],
-  "generated_at": "2025-08-28T09:28:46Z",
+  "generated_at": "2025-08-28T11:29:17Z",
   "metrics": {
     "_totals": {
       "CONFIDENCE.HIGH": 0,
@@ -11,7 +11,20 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 135,
+      "loc": 316,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/model\\model_validator.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 181,
       "nosec": 0,
       "skipped_tests": 0
     },
