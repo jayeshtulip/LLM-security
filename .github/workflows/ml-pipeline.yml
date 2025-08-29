@@ -1,11 +1,9 @@
-name: ML Pipeline
-
+﻿name: ML Pipeline
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
 jobs:
   security-scan:
     runs-on: ubuntu-latest
@@ -25,7 +23,6 @@ jobs:
         bandit -r src/ || true
         pip-audit || true
         echo "Security scan completed"
-
   quality-check:
     runs-on: ubuntu-latest
     name: Quality Check
@@ -43,7 +40,6 @@ jobs:
         echo "Checking code quality..."
         black --check src/ || echo "Formatting check done"
         flake8 src/ --max-line-length=88 || echo "Linting check done"
-
   model-validation:
     runs-on: ubuntu-latest
     name: Model Validation
@@ -62,27 +58,22 @@ jobs:
         python -c "
         import sys
         sys.path.append('.')
-        
         try:
             from src.model.predictor import LoanPredictor
             predictor = LoanPredictor()
-            
             from src.api.schemas import LoanApplication
             sample = LoanApplication(
                 Gender='Male', Married='Yes', Dependents='1', Education='Graduate',
                 Self_Employed='No', ApplicantIncome=5000, CoapplicantIncome=0,
                 LoanAmount=100, Loan_Amount_Term=360, Credit_History=1, Property_Area='Urban'
             )
-            
             result = predictor.predict(sample)
             print(f'Model test successful: {result[\"prediction_label\"]}')
             print(f'Confidence: {result[\"confidence\"]:.3f}')
             print('MODEL PERFORMANCE GATE: PASSED')
-            
         except Exception as e:
             print(f'Model test: {e}')
         "
-
   api-test:
     runs-on: ubuntu-latest
     name: API Test
@@ -101,7 +92,6 @@ jobs:
         python -c "
         import sys
         sys.path.append('.')
-        
         try:
             from src.main import app
             print('FastAPI app imported successfully')
@@ -109,19 +99,41 @@ jobs:
         except Exception as e:
             print(f'API test: {e}')
         "
-
-  deployment-ready:
+  deploy:
     runs-on: ubuntu-latest
-    name: Deployment Ready
+    name: Deploy to Kubernetes
     needs: [security-scan, quality-check, model-validation, api-test]
+    if: github.ref == 'refs/heads/main'
     steps:
-    - name: Deployment summary
+    - uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-south-1
+    - name: Install kubectl
       run: |
-        echo "PIPELINE COMPLETED SUCCESSFULLY"
-        echo "==============================="
-        echo "Security Scan: PASSED"
-        echo "Quality Check: PASSED" 
-        echo "Model Validation: PASSED"
-        echo "API Test: PASSED"
-        echo ""
-        echo "Your ML Pipeline is ready for deployment"
+        curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+    - name: Configure kubectl for EKS
+      run: |
+        aws eks update-kubeconfig --region ap-south-1 --name loan-eks-simple
+    - name: Update ConfigMap with latest code
+      run: |
+        kubectl delete configmap fastapi-code -n loan-default --ignore-not-found
+        kubectl create configmap fastapi-code -n loan-default \
+          --from-file=requirements.txt=kubernetes/production/requirements.txt \
+          --from-file=main.py=kubernetes/production/main.py
+    - name: Deploy to Kubernetes
+      run: |
+        kubectl apply -f kubernetes/production/actual-ml-api.yaml
+        kubectl rollout restart deployment/fastapi-loan-model -n loan-default
+        kubectl rollout status deployment/fastapi-loan-model -n loan-default --timeout=300s
+    - name: Verify deployment
+      run: |
+        echo "Checking deployment status..."
+        kubectl get pods -n loan-default
+        kubectl get service fastapi-loan-service -n loan-default
+        echo "Deployment completed successfully"
