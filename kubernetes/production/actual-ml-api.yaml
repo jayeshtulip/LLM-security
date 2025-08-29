@@ -1,0 +1,227 @@
+# kubernetes/actual-ml-api.yaml - Deploy your real ML API
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loan-prediction-api
+  namespace: loan-default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loan-prediction-api
+  template:
+    metadata:
+      labels:
+        app: loan-prediction-api
+    spec:
+      containers:
+      - name: loan-api
+        image: python:3.10-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          # Install dependencies
+          pip install fastapi uvicorn scikit-learn pandas numpy pydantic joblib
+          
+          # Create app structure
+          mkdir -p /app/src/model /app/src/api /app/models
+          
+          # Create schemas
+          cat > /app/src/api/schemas.py << 'EOF'
+          from pydantic import BaseModel, Field
+          from typing import Dict, Any
+          from datetime import datetime
+
+          class LoanApplication(BaseModel):
+              Gender: str = Field(..., example="Male")
+              Married: str = Field(..., example="Yes") 
+              Dependents: str = Field(..., example="1")
+              Education: str = Field(..., example="Graduate")
+              Self_Employed: str = Field(..., example="No")
+              ApplicantIncome: int = Field(..., example=5849)
+              CoapplicantIncome: int = Field(..., example=0)
+              LoanAmount: int = Field(..., example=120)
+              Loan_Amount_Term: int = Field(..., example=360)
+              Credit_History: int = Field(..., example=1)
+              Property_Area: str = Field(..., example="Urban")
+
+          class HealthResponse(BaseModel):
+              status: str
+              timestamp: datetime
+              version: str
+              model_status: str
+          EOF
+          
+          # Create predictor (simplified)
+          cat > /app/src/model/predictor.py << 'EOF'
+          import pandas as pd
+          import numpy as np
+          from sklearn.ensemble import RandomForestClassifier
+          from sklearn.preprocessing import LabelEncoder
+          from sklearn.model_selection import train_test_split
+          import joblib
+          import os
+
+          class LoanPredictor:
+              def __init__(self):
+                  self.model = None
+                  self.encoders = {}
+                  self.train_simple_model()
+              
+              def train_simple_model(self):
+                  # Create simple synthetic data
+                  np.random.seed(42)
+                  n = 1000
+                  
+                  data = {
+                      'Gender': np.random.choice(['Male', 'Female'], n),
+                      'Credit_History': np.random.choice([0, 1], n, p=[0.2, 0.8]),
+                      'ApplicantIncome': np.random.randint(1000, 15000, n),
+                      'LoanAmount': np.random.randint(50, 500, n)
+                  }
+                  
+                  df = pd.DataFrame(data)
+                  
+                  # Create target
+                  approval_prob = (df['Credit_History'] * 0.6 + 
+                                 (df['ApplicantIncome'] / 10000) * 0.4)
+                  df['Approved'] = (approval_prob > 0.5).astype(int)
+                  
+                  # Train model
+                  self.encoders['Gender'] = LabelEncoder()
+                  df['Gender_encoded'] = self.encoders['Gender'].fit_transform(df['Gender'])
+                  
+                  X = df[['Gender_encoded', 'Credit_History', 'ApplicantIncome', 'LoanAmount']]
+                  y = df['Approved']
+                  
+                  self.model = RandomForestClassifier(n_estimators=10, random_state=42)
+                  self.model.fit(X, y)
+              
+              def predict(self, loan_app):
+                  # Simple prediction logic
+                  gender_encoded = 1 if loan_app.Gender == 'Male' else 0
+                  features = [[gender_encoded, loan_app.Credit_History, 
+                             loan_app.ApplicantIncome, loan_app.LoanAmount]]
+                  
+                  pred = self.model.predict(features)[0]
+                  prob = self.model.predict_proba(features)[0]
+                  
+                  return {
+                      "prediction": int(pred),
+                      "prediction_label": "Approved" if pred == 1 else "Rejected",
+                      "probability": {"approved": float(prob[1]), "rejected": float(prob[0])},
+                      "confidence": float(max(prob)),
+                      "model_version": "1.0.0"
+                  }
+          EOF
+          
+          # Create main FastAPI app
+          cat > /app/src/main.py << 'EOF'
+          from fastapi import FastAPI, HTTPException
+          from datetime import datetime
+          import sys
+          sys.path.append('/app')
+          
+          from src.model.predictor import LoanPredictor
+          from src.api.schemas import LoanApplication, HealthResponse
+          
+          app = FastAPI(title="Loan Prediction API", version="1.0.0")
+          
+          # Initialize model
+          predictor = LoanPredictor()
+          
+          @app.get("/health")
+          def health():
+              return {
+                  "status": "healthy",
+                  "timestamp": datetime.utcnow(),
+                  "version": "1.0.0",
+                  "model_status": "loaded"
+              }
+          
+          @app.get("/ready")
+          def ready():
+              return {"status": "ready"}
+          
+          @app.get("/")
+          def root():
+              return {
+                  "message": "Loan Prediction API",
+                  "version": "1.0.0",
+                  "endpoints": ["/health", "/ready", "/predict", "/docs"]
+              }
+          
+          @app.post("/predict")
+          def predict(loan_app: LoanApplication):
+              try:
+                  result = predictor.predict(loan_app)
+                  return result
+              except Exception as e:
+                  raise HTTPException(status_code=500, detail=str(e))
+          
+          @app.get("/predict/example")
+          def predict_example():
+              sample = LoanApplication(
+                  Gender="Male", Married="Yes", Dependents="1", Education="Graduate",
+                  Self_Employed="No", ApplicantIncome=5849, CoapplicantIncome=0,
+                  LoanAmount=120, Loan_Amount_Term=360, Credit_History=1, Property_Area="Urban"
+              )
+              return predict(sample)
+          EOF
+          
+          # Create __init__.py files
+          touch /app/src/__init__.py /app/src/model/__init__.py /app/src/api/__init__.py
+          
+          # Start the actual FastAPI application
+          cd /app
+          uvicorn src.main:app --host 0.0.0.0 --port 8000
+
+        ports:
+        - containerPort: 8000
+        
+        # Very conservative resource limits for t3.micro
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        
+        env:
+        - name: PYTHONPATH
+          value: "/app"
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loan-prediction-service
+  namespace: loan-default
+spec:
+  selector:
+    app: loan-prediction-api
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+  type: ClusterIP
